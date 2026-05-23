@@ -8,63 +8,80 @@ const reservationSchema = z.object({
   quantity: z.number().min(1),
 });
 
+type InventoryRow = {
+  id: string;
+  totalStock: number;
+  reservedStock: number;
+};
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-
     const validatedData = reservationSchema.parse(body);
 
-    const inventory = await prisma.inventory.findFirst({
-      where: {
-        productId: validatedData.productId,
-        warehouseId: validatedData.warehouseId,
-      },
-    });
+    const reservation = await prisma.$transaction(async (tx) => {
+      const inventories = await tx.$queryRaw`
+        SELECT id, "totalStock", "reservedStock"
+        FROM "Inventory"
+        WHERE "productId" = ${validatedData.productId}
+          AND "warehouseId" = ${validatedData.warehouseId}
+        FOR UPDATE
+      ` as InventoryRow[];
 
-    if (!inventory) {
-      return NextResponse.json(
-        { error: "Inventory not found" },
-        { status: 404 }
-      );
-    }
+      if (inventories.length === 0) {
+        throw new Error("INVENTORY_NOT_FOUND");
+      }
 
-    const availableStock =
-      inventory.totalStock - inventory.reservedStock;
+      const inventory = inventories[0];
+      const availableStock = inventory.totalStock - inventory.reservedStock;
 
-    if (availableStock < validatedData.quantity) {
-      return NextResponse.json(
-        { error: "Not enough stock available" },
-        { status: 409 }
-      );
-    }
+      if (availableStock < validatedData.quantity) {
+        throw new Error("INSUFFICIENT_STOCK");
+      }
 
-    await prisma.inventory.update({
-      where: {
-        id: inventory.id,
-      },
-      data: {
-        reservedStock: {
-          increment: validatedData.quantity,
+      await tx.inventory.update({
+        where: { id: inventory.id },
+        data: { reservedStock: { increment: validatedData.quantity } },
+      });
+
+      const newReservation = await tx.reservation.create({
+        data: {
+          productId: validatedData.productId,
+          warehouseId: validatedData.warehouseId,
+          quantity: validatedData.quantity,
+          expiresAt: new Date(Date.now() + 10 * 60 * 1000),
         },
-      },
+        include: { product: true, warehouse: true },
+      });
+
+      return newReservation;
     });
 
-    const reservation = await prisma.reservation.create({
-      data: {
-        productId: validatedData.productId,
-        warehouseId: validatedData.warehouseId,
-        quantity: validatedData.quantity,
-        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
-      },
-    });
-
-    return NextResponse.json(reservation);
-
+    return NextResponse.json(reservation, { status: 201 });
   } catch (error) {
-    console.error(error);
-
+    if (error instanceof Error) {
+      if (error.message === "INVENTORY_NOT_FOUND") {
+        return NextResponse.json(
+          { error: "Inventory not found for this product and warehouse" },
+          { status: 404 }
+        );
+      }
+      if (error.message === "INSUFFICIENT_STOCK") {
+        return NextResponse.json(
+          { error: "Not enough stock available" },
+          { status: 409 }
+        );
+      }
+    }
+    if (error instanceof z.ZodError) {
+      return NextResponse.json(
+        { error: "Invalid request data", details: error.errors },
+        { status: 400 }
+      );
+    }
+    console.error("Reservation error:", error);
     return NextResponse.json(
-      { error: "Reservation failed" },
+      { error: "Reservation failed. Please try again." },
       { status: 500 }
     );
   }

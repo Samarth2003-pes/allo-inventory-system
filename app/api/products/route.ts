@@ -3,35 +3,48 @@ import { NextResponse } from "next/server";
 
 export async function GET() {
   try {
-    const products = await prisma.product.findMany({
-      include: {
-        inventories: {
-          include: {
-            warehouse: true,
-          },
-        },
-      },
+    // Lazy cleanup — release any expired reservations before showing stock
+    const expiredReservations = await prisma.reservation.findMany({
+      where: { status: "PENDING", expiresAt: { lt: new Date() } },
     });
 
-    const formattedProducts = products.map((product) => ({
+    if (expiredReservations.length > 0) {
+      await prisma.$transaction(async (tx) => {
+        for (const res of expiredReservations) {
+          await tx.inventory.updateMany({
+            where: { productId: res.productId, warehouseId: res.warehouseId },
+            data: { reservedStock: { decrement: res.quantity } },
+          });
+          await tx.reservation.update({
+            where: { id: res.id },
+            data: { status: "RELEASED" },
+          });
+        }
+      });
+    }
+
+    const products = await prisma.product.findMany({
+      include: { inventories: { include: { warehouse: true } } },
+      orderBy: { name: "asc" },
+    });
+
+    const formatted = products.map((product) => ({
       id: product.id,
       name: product.name,
       description: product.description,
       inventory: product.inventories.map((inv) => ({
-        warehouseId: inv.warehouse.id,
+        warehouseId: inv.warehouseId,
         warehouseName: inv.warehouse.name,
+        warehouseLocation: inv.warehouse.location,
         totalStock: inv.totalStock,
         reservedStock: inv.reservedStock,
         availableStock: inv.totalStock - inv.reservedStock,
       })),
     }));
 
-    return NextResponse.json(formattedProducts);
+    return NextResponse.json(formatted);
   } catch (error) {
-    console.error(error);
-    return NextResponse.json(
-      { error: "Failed to fetch products" },
-      { status: 500 }
-    );
+    console.error("Products error:", error);
+    return NextResponse.json({ error: "Failed to fetch products" }, { status: 500 });
   }
 }

@@ -1,73 +1,56 @@
 import { prisma } from "@/lib/prisma";
 import { NextRequest, NextResponse } from "next/server";
 
+type ReservationRow = {
+  id: string;
+  status: string;
+  productId: string;
+  warehouseId: string;
+  quantity: number;
+};
+
 export async function POST(
   req: NextRequest,
   context: { params: Promise<{ id: string }> }
 ) {
   try {
-
     const { id } = await context.params;
 
-    const reservation = await prisma.reservation.findUnique({
-      where: { id },
+    const result = await prisma.$transaction(async (tx) => {
+      const reservations = await tx.$queryRaw`
+        SELECT id, status, "productId", "warehouseId", quantity
+        FROM "Reservation"
+        WHERE id = ${id}
+        FOR UPDATE
+      ` as ReservationRow[];
+
+      if (reservations.length === 0) throw new Error("NOT_FOUND");
+
+      const reservation = reservations[0];
+
+      if (reservation.status !== "PENDING") throw new Error("ALREADY_PROCESSED");
+
+      await tx.inventory.updateMany({
+        where: { productId: reservation.productId, warehouseId: reservation.warehouseId },
+        data: { reservedStock: { decrement: reservation.quantity } },
+      });
+
+      return await tx.reservation.update({
+        where: { id },
+        data: { status: "RELEASED" },
+        include: { product: true, warehouse: true },
+      });
     });
 
-    if (!reservation) {
-      return NextResponse.json(
-        { error: "Reservation not found" },
-        { status: 404 }
-      );
-    }
-
-    if (reservation.status !== "PENDING") {
-      return NextResponse.json(
-        { error: "Reservation already processed" },
-        { status: 400 }
-      );
-    }
-
-    const inventory = await prisma.inventory.findFirst({
-      where: {
-        productId: reservation.productId,
-        warehouseId: reservation.warehouseId,
-      },
-    });
-
-    if (!inventory) {
-      return NextResponse.json(
-        { error: "Inventory not found" },
-        { status: 404 }
-      );
-    }
-
-    await prisma.inventory.update({
-      where: {
-        id: inventory.id,
-      },
-      data: {
-        reservedStock: {
-          decrement: reservation.quantity,
-        },
-      },
-    });
-
-    const updatedReservation = await prisma.reservation.update({
-      where: { id },
-      data: {
-        status: "RELEASED",
-      },
-    });
-
-    return NextResponse.json(updatedReservation);
-
+    return NextResponse.json(result);
   } catch (error) {
-
-    console.error(error);
-
-    return NextResponse.json(
-      { error: "Release failed" },
-      { status: 500 }
-    );
+    if (error instanceof Error) {
+      if (error.message === "NOT_FOUND")
+        return NextResponse.json({ error: "Reservation not found" }, { status: 404 });
+      if (error.message === "ALREADY_PROCESSED")
+        return NextResponse.json({ error: "Reservation has already been confirmed or cancelled" }, { status: 400 });
+    }
+    console.error("Release error:", error);
+    return NextResponse.json({ error: "Release failed. Please try again." }, { status: 500 });
   }
 }

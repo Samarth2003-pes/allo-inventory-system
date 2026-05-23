@@ -1,83 +1,71 @@
 import { prisma } from "@/lib/prisma";
 import { NextRequest, NextResponse } from "next/server";
 
+type ReservationRow = {
+  id: string;
+  status: string;
+  expiresAt: Date;
+  productId: string;
+  warehouseId: string;
+  quantity: number;
+};
+
 export async function POST(
   req: NextRequest,
   context: { params: Promise<{ id: string }> }
 ) {
   try {
-
     const { id } = await context.params;
 
-    const reservation = await prisma.reservation.findUnique({
-      where: { id },
-    });
+    const result = await prisma.$transaction(async (tx) => {
+      const reservations = await tx.$queryRaw`
+        SELECT id, status, "expiresAt", "productId", "warehouseId", quantity
+        FROM "Reservation"
+        WHERE id = ${id}
+        FOR UPDATE
+      ` as ReservationRow[];
 
-    if (!reservation) {
-      return NextResponse.json(
-        { error: "Reservation not found" },
-        { status: 404 }
-      );
-    }
+      if (reservations.length === 0) throw new Error("NOT_FOUND");
 
-    if (reservation.status !== "PENDING") {
-      return NextResponse.json(
-        { error: "Reservation already processed" },
-        { status: 400 }
-      );
-    }
+      const reservation = reservations[0];
 
-    if (new Date() > reservation.expiresAt) {
-      return NextResponse.json(
-        { error: "Reservation expired" },
-        { status: 410 }
-      );
-    }
+      if (reservation.status !== "PENDING") throw new Error("ALREADY_PROCESSED");
 
-    const inventory = await prisma.inventory.findFirst({
-      where: {
-        productId: reservation.productId,
-        warehouseId: reservation.warehouseId,
-      },
-    });
+      if (new Date() > new Date(reservation.expiresAt)) {
+        await tx.inventory.updateMany({
+          where: { productId: reservation.productId, warehouseId: reservation.warehouseId },
+          data: { reservedStock: { decrement: reservation.quantity } },
+        });
+        await tx.reservation.update({ where: { id }, data: { status: "RELEASED" } });
+        throw new Error("EXPIRED");
+      }
 
-    if (!inventory) {
-      return NextResponse.json(
-        { error: "Inventory not found" },
-        { status: 404 }
-      );
-    }
-
-    await prisma.inventory.update({
-      where: {
-        id: inventory.id,
-      },
-      data: {
-        totalStock: {
-          decrement: reservation.quantity,
+      await tx.inventory.updateMany({
+        where: { productId: reservation.productId, warehouseId: reservation.warehouseId },
+        data: {
+          totalStock: { decrement: reservation.quantity },
+          reservedStock: { decrement: reservation.quantity },
         },
-        reservedStock: {
-          decrement: reservation.quantity,
-        },
-      },
+      });
+
+      return await tx.reservation.update({
+        where: { id },
+        data: { status: "CONFIRMED" },
+        include: { product: true, warehouse: true },
+      });
     });
 
-    const updatedReservation = await prisma.reservation.update({
-      where: { id },
-      data: {
-        status: "CONFIRMED",
-      },
-    });
-
-    return NextResponse.json(updatedReservation);
-
+    return NextResponse.json(result);
   } catch (error) {
-
-    console.error(error);
-
-    return NextResponse.json(
-      { error: "Confirmation failed" },
-      { status: 500 }
-    );
+    if (error instanceof Error) {
+      if (error.message === "NOT_FOUND")
+        return NextResponse.json({ error: "Reservation not found" }, { status: 404 });
+      if (error.message === "ALREADY_PROCESSED")
+        return NextResponse.json({ error: "Reservation has already been confirmed or cancelled" }, { status: 400 });
+      if (error.message === "EXPIRED")
+        return NextResponse.json({ error: "Reservation has expired. Your hold has been released." }, { status: 410 });
+    }
+    console.error("Confirm error:", error);
+    return NextResponse.json({ error: "Confirmation failed. Please try again." }, { status: 500 });
   }
 }
