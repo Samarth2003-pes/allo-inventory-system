@@ -4,7 +4,7 @@ A Next.js inventory reservation system built for the Allo Engineering take-home 
 
 ## Live URL
 
-[Add your Vercel URL here after deployment]
+https://allo-inventory-system-omega.vercel.app
 
 ---
 
@@ -32,8 +32,8 @@ npm install
 ### 2. Environment variables
 
 Create a `.env` file in the root of the project:
-DATABASE_URL="your_neon_postgresql_connection_string"
-CRON_SECRET="any_random_string_you_choose"
+DATABASE_URL="postgresql://neondb_owner:npg_l9HS5RsIUqCL@ep-weathered-queen-ap5f7tk0-pooler.c-7.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+CRON_SECRET="mysecret123"
 
 ### 3. Run migrations
 
